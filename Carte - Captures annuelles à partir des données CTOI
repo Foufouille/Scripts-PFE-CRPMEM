@@ -1,0 +1,314 @@
+# =========================================================
+# LIBRAIRIES
+# =========================================================
+
+library(pacman)
+p_load(dplyr, ggplot2, stringr, tibble, leaflet, leaflet.extras2,
+       sf, htmltools, raster, RColorBrewer, htmlwidgets)
+
+# =========================================================
+# 0. IMPORT & DÉCODAGE DES COORDONNÉES
+# =========================================================
+
+iotc_raw <- read.csv(
+  "C:/Users/Alphé ZOHOU/Documents/CRPMEM/CAPT_OI/BDD/CTOI.csv",
+  header = TRUE, sep = ","
+)
+
+iotc_grid_to_coords <- function(codes) {
+  codes <- as.character(codes)
+  out <- tibble(code = codes) %>%
+    mutate(
+      size_code = str_sub(code, 1, 1),
+      quad_code = str_sub(code, 2, 2),
+      lat_code  = as.numeric(str_sub(code, 3, 4)),
+      lon_code  = as.numeric(str_sub(code, 5, 7)),
+      cell_size = case_when(
+        size_code == "5" ~ 1,
+        size_code == "6" ~ 5,
+        TRUE ~ NA_real_
+      ),
+      lat_min = case_when(
+        quad_code == "1" ~  lat_code,
+        quad_code == "2" ~ -(lat_code + cell_size),
+        quad_code == "3" ~ -(lat_code + cell_size),
+        quad_code == "4" ~  lat_code,
+        TRUE ~ NA_real_
+      ),
+      lon_min = case_when(
+        quad_code %in% c("1", "2") ~  lon_code,
+        quad_code %in% c("3", "4") ~ -lon_code,
+        TRUE ~ NA_real_
+      )
+    )
+  out
+}
+
+# =========================================================
+# 1. NETTOYAGE & AGRÉGATION EN MAILLES
+# =========================================================
+
+coords <- iotc_grid_to_coords(iotc_raw$FISHING_GROUND_CODE)
+
+data_clean <- iotc_raw %>%
+  mutate(
+    espece     = str_trim(toupper(as.character(SPECIES_CODE))),
+    catch_t    = as.numeric(CATCH),
+    Annee      = as.integer(YEAR),
+    lat_maille = coords$lat_min,
+    lon_maille = coords$lon_min
+  ) %>%
+  filter(
+    FLEET_CODE == "EUREU",
+    FISHERY_CODE == "LLO",
+    !FISHING_GROUND_CODE %in% c(9000020, 9200020),
+    espece %in% c("YFT", "BET", "SWO", "SKJ"),
+    !is.na(lat_maille), !is.na(lon_maille), !is.na(catch_t)
+  ) %>%
+  group_by(Annee, espece, lat_maille, lon_maille) %>%
+  summarise(
+    catch = sum(catch_t, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# =========================================================
+# 2. ZEE & HAUTS-FONDS
+# =========================================================
+
+sf::sf_use_s2(FALSE)
+
+zee_madagascar <- sf::st_read(
+  "C:/Users/Alphé ZOHOU/Documents/CRPMEM/CAPT_OI/DATA_CTOI/ZEE_MADAGASCAR/eez.shp"
+)
+zee_reunion <- sf::st_read(
+  "C:/Users/Alphé ZOHOU/Documents/CRPMEM/CAPT_OI/DATA_CTOI/ZEE_REUNION/eez.shp"
+)
+zee_maurice <- sf::st_read(
+  "C:/Users/Alphé ZOHOU/Documents/CRPMEM/CAPT_OI/DATA_CTOI/ZEE_MAURICE/ZEE_MAURICE.shp"
+)
+
+hf_maurice <- sf::st_read(
+  "C:/Users/Alphé ZOHOU/Documents/CRPMEM/CAPT_OI/DATA_HAUTS_FONDS_SHP/Haut-fond_Nord-Est-Maurice.shp"
+) %>% sf::st_transform(crs = 4326)
+
+hf_mada <- sf::st_read(
+  "C:/Users/Alphé ZOHOU/Documents/CRPMEM/CAPT_OI/DATA_HAUTS_FONDS_SHP/Haut-fond_Sud-Mada.shp"
+) %>% sf::st_transform(crs = 4326)
+
+# =========================================================
+# 3. PARAMÈTRES GRAPHIQUES
+# =========================================================
+
+bornes_classes <- list(
+  YFT = c(0,  1,  4, 10, 20, 45,  67),
+  BET = c(0, 0.5, 2,  5, 10, 25,  51),
+  SWO = c(0, 0.5, 2,  8, 20, 40, 160)
+)
+
+couleurs_classes <- brewer.pal(6, "YlOrRd")
+
+# =========================================================
+# 4. FONCTION CARTE
+# =========================================================
+
+carte_ctoi <- function(species, year) {
+  
+  bornes   <- bornes_classes[[species]]
+  couleurs <- couleurs_classes
+  
+  mapdata <- data_clean %>%
+    filter(espece == species, Annee == year)
+  
+  if (nrow(mapdata) == 0) {
+    message("Aucune donnée pour ", species, " — ", year)
+    return(NULL)
+  }
+  
+  cell_size <- ifelse(str_sub(as.character(
+    iotc_raw$FISHING_GROUND_CODE[
+      iotc_raw$FLEET_CODE == "EUREU" &
+        iotc_raw$SPECIES_CODE == species
+    ][1]), 1, 1) == "6", 5, 1)
+  
+  dat <- data.frame(
+    x = mapdata$lon_maille + cell_size / 2 - 1,
+    y = mapdata$lat_maille - cell_size / 2 + 3,
+    z = mapdata$catch
+  )
+  
+  if (length(unique(dat$x)) < 2 || length(unique(dat$y)) < 2) {
+    message("Pas assez de mailles pour ", species, " — ", year)
+    return(NULL)
+  }
+  
+  r <- raster(
+    xmn = 42, xmx = 67,
+    ymn = -30, ymx = -10,
+    res = 1,
+    crs = sp::CRS("+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs")
+  )
+  r <- rasterize(cbind(dat$x, dat$y), r, field = dat$z, fun = sum)
+  
+  pal_discret <- colorBin(
+    palette  = couleurs,
+    domain   = c(bornes[1], bornes[7]),
+    bins     = bornes,
+    na.color = "transparent"
+  )
+  
+  labels_classes <- paste0(bornes[-7], " – ", bornes[-1], " t")
+  titre_carte    <- paste0("Captures CTOI — ", species, " (", year, ")")
+  
+  # --- Flèche Nord ---
+  fleche_nord <- tags$div(
+    style = "position: absolute; top: 40px; right: 0;
+             z-index: 1000; background: white; padding: 6px 10px;
+             border-radius: 6px 0 0 6px; border: 1px solid #ccc;
+             border-right: none; text-align: center; pointer-events: none;",
+    tags$div(style = "font-size: 22px; line-height: 1; color: #222;",
+             HTML("&#11014;")),
+    tags$div(style = "font-size: 11px; font-weight: bold; color: #222;
+                      margin-top: 2px;", "N")
+  )
+  
+  # --- Légende ---
+  bloc_legende <- tags$div(
+    style = "position: absolute; top: 110px; right: 0;
+             z-index: 1000; background: white; padding: 8px 12px;
+             border-radius: 6px 0 0 6px; border: 1px solid #ccc;
+             border-right: none; font-size: 12px; width: 150px;
+             pointer-events: none;",
+    tags$div(style = "font-weight: bold; font-size: 13px; margin-bottom: 6px;",
+             "Légende"),
+    # ZEE
+    tags$div(style = "font-weight: bold; margin-bottom: 4px; font-size: 11px;
+                      text-transform: uppercase; color: #555;", "ZEE"),
+    tags$div(style = "display: flex; align-items: center; margin-bottom: 3px;",
+             tags$div(style = "width: 14px; height: 14px; background: green;
+                               opacity: 0.7; border: 1.5px solid green;
+                               margin-right: 7px; flex-shrink: 0; border-radius: 2px;"),
+             tags$span("Madagascar")),
+    tags$div(style = "display: flex; align-items: center; margin-bottom: 3px;",
+             tags$div(style = "width: 14px; height: 14px; background: purple;
+                               opacity: 0.7; border: 1.5px solid purple;
+                               margin-right: 7px; flex-shrink: 0; border-radius: 2px;"),
+             tags$span("Maurice")),
+    tags$div(style = "display: flex; align-items: center; margin-bottom: 8px;",
+             tags$div(style = "width: 14px; height: 14px; background: #333;
+                               opacity: 0.7; border: 1.5px solid #333;
+                               margin-right: 7px; flex-shrink: 0; border-radius: 2px;"),
+             tags$span("Réunion")),
+    # Hauts-fonds
+    tags$div(style = "font-weight: bold; margin-bottom: 4px; font-size: 11px;
+                      text-transform: uppercase; color: #555; margin-top: 4px;",
+             "Hauts-fonds"),
+    tags$div(style = "display: flex; align-items: center; margin-bottom: 8px;",
+             tags$div(style = "width: 14px; height: 14px; background: black;
+                               opacity: 0.7;
+                               clip-path: polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%);
+                               margin-right: 7px; flex-shrink: 0;"),
+             tags$span("Hauts-fonds")),
+    # Captures
+    tags$div(style = "font-weight: bold; margin-bottom: 4px; font-size: 11px;
+                      text-transform: uppercase; color: #555;",
+             paste0("Captures ", species, " (t)")),
+    tagList(lapply(seq_along(labels_classes), function(i) {
+      tags$div(style = "display: flex; align-items: center; margin-bottom: 3px;",
+               tags$div(style = paste0(
+                 "width: 14px; height: 14px; background: ", couleurs[i],
+                 "; margin-right: 7px; flex-shrink: 0; border-radius: 2px;"
+               )),
+               tags$span(labels_classes[i]))
+    }))
+  )
+  
+  # --- Titre ---
+  bloc_titre_css <- tags$div(
+    style = "position: absolute; top: 0; left: 50%; transform: translateX(-50%);
+             z-index: 1000; background: white; padding: 5px 14px;
+             border-radius: 0 0 6px 6px; border: 1px solid #ccc;
+             border-top: none; font-size: 14px; font-weight: bold;
+             white-space: nowrap; pointer-events: none;",
+    titre_carte
+  )
+  
+  # --- Carte Leaflet ---
+  m <- leaflet() %>%
+    fitBounds(
+      lng1 = 47,
+      lat1 = -33.25,
+      lng2 = 67.5,
+      lat2 = -10.75
+    ) %>%
+    addProviderTiles("Esri.OceanBasemap") %>%
+    addRasterImage(r, colors = pal_discret, opacity = 0.8) %>%
+    addPolygons(data = zee_madagascar, color = "green", weight = 1,
+                fillColor = "green", fillOpacity = 0.08,
+                label = "ZEE Madagascar") %>%
+    addPolygons(data = zee_reunion, color = "black", weight = 1,
+                fillColor = "black", fillOpacity = 0.08,
+                label = "ZEE Réunion") %>%
+    addPolygons(data = zee_maurice, color = "purple", weight = 1,
+                fillColor = "purple", fillOpacity = 0.08,
+                label = "ZEE Maurice") %>%
+    addLabelOnlyMarkers(
+      lng   = 55.5,
+      lat   = -20.5,
+      label = "La Réunion",
+      labelOptions = labelOptions(
+        noHide    = TRUE,
+        direction = "bottom",
+        textOnly  = TRUE,
+        style     = list(
+          "font-size"   = "9px",
+          "font-weight" = "normal",
+          "font-style"  = "italic",
+          "color"       = "#333"
+        )
+      )
+    ) %>%
+    addMarkers(
+      data = hf_maurice,
+      icon = makeIcon(
+        iconUrl = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpolygon points='12,2 15,9 22,9 17,14 19,21 12,17 5,21 7,14 2,9 9,9' fill='black' opacity='0.7'/%3E%3C/svg%3E",
+        iconWidth = 20, iconHeight = 20
+      ),
+      label = "Haut-fond Nord-Est Maurice"
+    ) %>%
+    addMarkers(
+      data = hf_mada,
+      icon = makeIcon(
+        iconUrl = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpolygon points='12,2 15,9 22,9 17,14 19,21 12,17 5,21 7,14 2,9 9,9' fill='black' opacity='0.7'/%3E%3C/svg%3E",
+        iconWidth = 20, iconHeight = 20
+      ),
+      label = "Haut-fond Sud Madagascar"
+    ) %>%
+    addScaleBar(position = "bottomleft",
+                options  = scaleBarOptions(imperial = FALSE)) %>%
+    htmlwidgets::onRender("
+      function(el, x) {
+        var scale = el.querySelector('.leaflet-bottom.leaflet-left');
+        scale.style.marginBottom = '30px';
+      }
+    ")
+  
+  m <- prependContent(m, bloc_titre_css)
+  m <- prependContent(m, fleche_nord)
+  m <- prependContent(m, bloc_legende)
+  
+  m
+}
+
+# =========================================================
+# 5. GÉNÉRATION DES CARTES
+# =========================================================
+
+species <- "YFT"    # "YFT", "BET" ou "SWO"
+ year    <- 2018
+ carte_ctoi(species, year)
+
+#for (sp in c("YFT", "BET", "SWO")) {
+#  for (yr in 2018:2024) {
+#    print(carte_ctoi(sp, yr))
+#  }
+#}
