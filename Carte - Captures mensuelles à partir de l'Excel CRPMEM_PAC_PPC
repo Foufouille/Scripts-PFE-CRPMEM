@@ -1,0 +1,236 @@
+# ============================================================
+#  Carte des captures PAC/PPC — La Réunion
+#  Source : CRPMEM_PAC_PPC.xlsx + shapefile secteurs statistiques
+# ============================================================
+
+# install.packages("pacman")
+library(pacman)
+p_load(dplyr, readxl, sf, leaflet, RColorBrewer, htmltools, htmlwidgets)
+
+# ============================================================
+#  1. Chargement des données
+# ============================================================
+
+secteurs <- sf::st_read(
+  "C:/Users/Alphé ZOHOU/Documents/CRPMEM/CAPT_OI/DATA_SECTEURS_SHP/IFR_L_SECTEURS_STATISTIQUES_LA_REUNION_LOC_LEVEL_151_v2.shp"
+)
+
+data_pac <- readxl::read_excel(
+  "C:/Users/Alphé ZOHOU/Documents/CRPMEM/CAPT_OI/BDD/CRPMEM_PAC_PPC.xlsx"
+)
+
+# ============================================================
+#  2. Bounding box + paramètres fixes
+# ============================================================
+
+bb <- sf::st_bbox(secteurs)
+
+fit_lng1 <- as.numeric(bb["xmin"]) - 1
+fit_lat1 <- as.numeric(bb["ymin"]) - 0.5
+fit_lng2 <- as.numeric(bb["xmax"]) + 1.75
+fit_lat2 <- as.numeric(bb["ymax"]) + 0.5
+
+# ============================================================
+#  3. Bornes fixes par espèce (quantiles sur tous les mois)
+#     6 classes à écarts constants entre 0 et max observé
+# ============================================================
+
+bornes_classes <- list(
+  YFT = round(seq(0, 12773, length.out = 7)),
+  BET = round(seq(0,  1950, length.out = 7))
+)
+
+quantiles_classes <- list(
+  YFT = c(0, 194, 498, 746, 1210, 1978, 12773),
+  BET = c(0,  41,  80, 169,  298,  484,  1950)
+)
+
+couleurs_classes <- brewer.pal(6, "Reds")
+
+# ============================================================
+#  4. FONCTION CARTE
+# ============================================================
+
+carte_pac_ppc <- function(espece, annee, mois = NULL) {
+  
+  noms_mois <- c("Janvier", "Février", "Mars", "Avril", "Mai", "Juin",
+                 "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre")
+  
+  label_periode <- if (!is.null(mois)) {
+    paste0(noms_mois[mois], " ", annee)
+  } else {
+    as.character(annee)
+  }
+  
+  titre_texte <- paste0("Captures PAC et PPC — ", espece, " (", label_periode, ")")
+  
+  # --- Filtrage ---
+  captures <- data_pac %>%
+    filter(
+      !is.na(loc.secteur),
+      !grepl("/", loc.secteur),
+      espece.codeFao == espece,
+      peche.codeFao %in% c("PAC", "PPC"),
+      as.integer(format(as.Date(evt.dateJour), "%Y")) == annee,
+      if (!is.null(mois)) as.integer(format(as.Date(evt.dateJour), "%m")) == mois
+      else TRUE
+    ) %>%
+    group_by(loc.secteur) %>%
+    summarise(capture_kg = sum(espece.quantite, na.rm = TRUE), .groups = "drop")
+  
+  # --- Jointure ---
+  secteurs_captures <- secteurs %>%
+    left_join(captures, by = c("LABEL" = "loc.secteur")) %>%
+    mutate(
+      capture_kg  = replace(capture_kg, is.na(capture_kg), 0),
+      capture_fmt = ifelse(
+        capture_kg > 0,
+        paste0(format(round(capture_kg), big.mark = " "), " kg"),
+        "Aucune capture"
+      )
+    )
+  
+  # --- Palette discrète calée sur les quantiles ---
+  bornes   <- quantiles_classes[[espece]]
+  couleurs <- couleurs_classes
+  
+  pal_discret <- colorBin(
+    palette  = couleurs,
+    domain   = c(bornes[1], bornes[7]),
+    bins     = bornes,
+    na.color = "transparent"
+  )
+  
+  secteurs_captures <- secteurs_captures %>%
+    mutate(fill_color = ifelse(
+      capture_kg == 0,
+      "#f0f0f0",
+      pal_discret(capture_kg)
+    ))
+  
+  # --- Labels légende (écarts constants en kg) ---
+  bornes_leg  <- quantiles_classes[[espece]]
+  labels_leg  <- paste0(
+    format(bornes_leg[-7], big.mark = " "), " – ",
+    format(bornes_leg[-1], big.mark = " "), " kg"
+  )
+  
+  # --- Popups ---
+  popups <- paste0(
+    "<b>Secteur :</b> ",          secteurs_captures$LABEL,       "<br>",
+    "<b>Zone :</b> ",             secteurs_captures$NAME,        "<br>",
+    "<b>Capture ", espece, " :</b> ", secteurs_captures$capture_fmt
+  )
+  
+  # --- Flèche Nord ---
+  fleche_nord <- tags$div(
+    style = "position: absolute; top: 40px; right: 0;
+             z-index: 1000; background: white; padding: 6px 10px;
+             border-radius: 6px 0 0 6px; border: 1px solid #ccc;
+             border-right: none; text-align: center;
+             pointer-events: none;",
+    tags$div(style = "font-size: 22px; line-height: 1; color: #222;",
+             HTML("&#11014;")),
+    tags$div(style = "font-size: 11px; font-weight: bold; color: #222; margin-top: 2px;",
+             "N")
+  )
+  
+  # --- Légende ---
+  bloc_legende <- tags$div(
+    style = "position: absolute; top: 110px; right: 0;
+             z-index: 1000; background: white; padding: 8px 12px;
+             border-radius: 6px 0 0 6px; border: 1px solid #ccc;
+             border-right: none; font-size: 12px; width: 145px;
+             pointer-events: none;",
+    tags$div(style = "font-weight: bold; font-size: 13px; margin-bottom: 6px;",
+             "Légende"),
+    tags$div(style = "font-weight: bold; margin-bottom: 4px; font-size: 11px;
+                      text-transform: uppercase; color: #555;",
+             paste0("Captures ", espece, " (kg)")),
+    tagList(lapply(seq_along(labels_leg), function(i) {
+      tags$div(style = "display: flex; align-items: center; margin-bottom: 3px;",
+               tags$div(style = paste0(
+                 "width: 14px; height: 14px; background: ", couleurs[i],
+                 "; margin-right: 7px; flex-shrink: 0; border-radius: 2px;"
+               )),
+               tags$span(labels_leg[i]))
+    })),
+    tags$div(style = "display: flex; align-items: center; margin-top: 5px;",
+             tags$div(style = "width: 14px; height: 14px; background: #f0f0f0;
+                               border: 1px dashed #555;
+                               margin-right: 7px; flex-shrink: 0; border-radius: 2px;"),
+             tags$span("Aucune capture"))
+  )
+  
+  # --- Titre ---
+  bloc_titre_css <- tags$div(
+    style = "position: absolute; top: 0; left: 50%; transform: translateX(-50%);
+             z-index: 1000; background: white; padding: 5px 14px;
+             border-radius: 0 0 6px 6px; border: 1px solid #ccc;
+             border-top: none; font-size: 14px; font-weight: bold;
+             white-space: nowrap; pointer-events: none;",
+    titre_texte
+  )
+  
+  # --- Carte ---
+  m <- leaflet(secteurs_captures) %>%
+    fitBounds(
+      lng1 = fit_lng1, lat1 = fit_lat1,
+      lng2 = fit_lng2, lat2 = fit_lat2
+    ) %>%
+    addProviderTiles("Esri.OceanBasemap") %>%
+    addPolygons(
+      fillColor    = ~fill_color,
+      fillOpacity  = 0.8,
+      color        = "#333333",
+      weight       = 1.5,
+      dashArray    = ~ifelse(capture_kg == 0, "5 5", "0"),
+      highlight    = highlightOptions(
+        weight       = 3,
+        color        = "#000000",
+        fillOpacity  = 0.9,
+        bringToFront = TRUE
+      ),
+      popup        = popups,
+      label        = ~paste0(LABEL, " — ", capture_fmt),
+      labelOptions = labelOptions(
+        style  = list("font-family" = "Arial", "font-size" = "13px"),
+        sticky = TRUE
+      )
+    ) %>%
+    addScaleBar(
+      position = "bottomleft",
+      options  = scaleBarOptions(imperial = FALSE)
+    ) %>%
+    htmlwidgets::onRender(paste0("
+      function(el, x) {
+        var map = this;
+        map.whenReady(function() {
+          // Zoom x2
+          map.zoomIn(1);
+          // Relever l'échelle de 2°
+          var scaleEl = el.querySelector('.leaflet-bottom.leaflet-left');
+          if (scaleEl) scaleEl.style.marginBottom = '30px';
+        });
+      }
+    "))
+  
+  m <- prependContent(m, bloc_titre_css)
+  m <- prependContent(m, fleche_nord)
+  m <- prependContent(m, bloc_legende)
+  
+  m
+}
+
+# ============================================================
+#  5. UTILISATION
+# ============================================================
+
+espece <- "YFT"   # "YFT" ou "BET"
+annee  <- 2023
+mois   <- 9       # 1 = janvier … 12 = décembre
+carte_pac_ppc(espece, annee, mois)
+
+# for (m in 1:12) {
+#   print(carte_pac_ppc("BET", 2023, mois = m))
+# }
