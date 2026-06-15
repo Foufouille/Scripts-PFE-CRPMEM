@@ -1,0 +1,260 @@
+# =========================================================
+# LIBRAIRIES
+# =========================================================
+
+library(tidyverse)
+library(lubridate)
+library(readxl)
+
+# =========================================================
+# 0. IMPORT
+# =========================================================
+
+data_raw <- read_excel(
+  "C:/Users/Alphé ZOHOU/Documents/CRPMEM/CAPT_OI/BDD/CRPMEM_PPH.xlsx"
+)
+
+# =========================================================
+# 1. NETTOYAGE
+# =========================================================
+
+data_clean <- data_raw %>%
+  
+  mutate(
+    espece     = str_trim(toupper(as.character(SN))),
+    date_brute = as.Date(DA),
+    Annee      = year(date_brute),
+    Mois       = month(date_brute),
+    Quantite   = as.numeric(WT) / 1000
+  ) %>%
+  
+  filter(
+    KEEP   == "GARDE",
+    espece %in% c("YFT", "BET"),
+    Annee  %in% 2023:2025,
+    !is.na(Mois),
+    !is.na(Quantite)
+  )
+
+# =========================================================
+# VÉRIFICATION RAPIDE
+# =========================================================
+
+cat("Lignes retenues :", nrow(data_clean), "\n")
+print(table(data_clean$Annee))
+
+# =========================================================
+# 2. PARAMÈTRES GRAPHIQUES
+# =========================================================
+
+mois_labels <- c(
+  "Jan", "Fév", "Mar", "Avr", "Mai", "Jun",
+  "Jul", "Aoû", "Sep", "Oct", "Nov", "Déc"
+)
+
+palette_annees <- c(
+  "2023" = "#2166ac",
+  "2024" = "#d6604d",
+  "2025" = "#4dac26"
+)
+
+# Quotas IOTC par espèce (en tonnes)
+quotas <- c("YFT" = 298, "BET" = 260)
+
+# Débuts IOTC par espèce (en tonnes)
+debuts <- c("YFT" = 25, "BET" = 22)
+
+# =========================================================
+# 3. FONCTION DE GRAPHIQUE CUMULÉ
+# =========================================================
+
+plot_espece_cumul <- function(espece_nom, data_clean) {
+  
+  quota_val <- quotas[espece_nom]
+  debut_val <- debuts[espece_nom]
+  
+  data_mois <- data_clean %>%
+    
+    filter(espece == espece_nom) %>%
+    
+    group_by(Annee, Mois) %>%
+    
+    summarise(
+      Quantite_Mois = sum(Quantite, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    
+    complete(
+      Annee = 2023:2025,
+      Mois  = 1:12,
+      fill  = list(Quantite_Mois = 0)
+    )
+  
+  data_cumul <- data_mois %>%
+    
+    arrange(Annee, Mois) %>%
+    
+    group_by(Annee) %>%
+    
+    mutate(
+      Quantite_Cumul = cumsum(Quantite_Mois),
+      # Rang de l'augmentation mensuelle dans l'année (1 = plus grande)
+      Rang_Augmentation = rank(-Quantite_Mois, ties.method = "first"),
+      # TRUE si ce mois fait partie des 3 plus grandes hausses
+      Top3 = Rang_Augmentation <= 3
+    ) %>%
+    
+    ungroup() %>%
+    
+    mutate(
+      
+      Mois_max_2025 = if_else(
+        Annee == 2025,
+        max(Mois[Annee == 2025 & Quantite_Mois > 0], na.rm = TRUE),
+        12L
+      ),
+      
+      Quantite_Cumul = if_else(
+        Annee == 2025 & Mois > Mois_max_2025,
+        NA_real_,
+        Quantite_Cumul
+      ),
+      
+      Top3 = if_else(
+        Annee == 2025 & Mois > Mois_max_2025,
+        FALSE,
+        Top3
+      ),
+      
+      Annee_Label = factor(Annee),
+      
+      Mois_Label = factor(
+        Mois,
+        levels = 1:12,
+        labels = mois_labels
+      )
+    )
+  
+  data_top3_segments <- data_cumul %>%
+    
+    filter(Top3, !is.na(Quantite_Cumul)) %>%
+    
+    left_join(
+      data_cumul %>%
+        dplyr::select(Annee, Mois, Cumul_Prec = Quantite_Cumul) %>%
+        mutate(Mois = Mois + 1),
+      by = c("Annee", "Mois")
+    ) %>%
+    
+    mutate(
+      Cumul_Prec = replace_na(Cumul_Prec, 0)
+    ) %>%
+    
+    filter(!is.na(Quantite_Cumul))
+  
+  data_droite <- tibble(
+    Mois       = c(1, 12),
+    Pred_Cumul = c(debut_val, quota_val),
+    Mois_Label = factor(c(1, 12), levels = 1:12, labels = mois_labels)
+  )
+  
+  p <- ggplot(
+    data_cumul,
+    aes(
+      x     = Mois_Label,
+      y     = Quantite_Cumul,
+      color = Annee_Label,
+      group = Annee_Label
+    )
+  ) +
+    
+    geom_hline(
+      yintercept = quota_val,
+      color      = "black",
+      linewidth  = 0.7,
+      linetype   = "dashed"
+    ) +
+    
+    annotate(
+      "text",
+      x     = 2.3,
+      y     = quota_val,
+      label = paste0("Quota(", quota_val, " t)"),
+      color = "black",
+      size  = 3.2,
+      hjust = 1,
+      vjust = -0.4
+    ) +
+    
+    geom_line(
+      linewidth = 0.5,
+      na.rm     = TRUE
+    ) +
+    
+    geom_point(
+      size  = 1.8,
+      na.rm = TRUE
+    ) +
+    
+    geom_segment(
+      data = data_top3_segments,
+      aes(
+        x    = as.numeric(Mois_Label) - 1,
+        xend = as.numeric(Mois_Label),
+        y    = Cumul_Prec,
+        yend = Quantite_Cumul,
+        color = Annee_Label
+      ),
+      linewidth = 2,
+      lineend   = "round",
+      inherit.aes = FALSE
+    ) +
+    
+    geom_line(
+      data        = data_droite,
+      aes(x = Mois_Label, y = Pred_Cumul, group = 1),
+      color       = "black",
+      linewidth   = 0.8,
+      linetype    = "solid",
+      inherit.aes = FALSE
+    ) +
+    
+    scale_color_manual(
+      values = palette_annees,
+      name   = "Année"
+    ) +
+    
+    scale_x_discrete(drop = FALSE) +
+    
+    scale_y_continuous(
+      breaks = function(x) sort(c(pretty(x), 50, 150, 250, 350)),
+      labels = scales::label_comma(
+        big.mark     = "\u00a0",
+        decimal.mark = ","
+      )
+    ) +
+    
+    labs(
+      title = paste0("Captures cumulées — ", espece_nom),
+      x     = NULL,
+      y     = "Quantités cumulées (t)"
+    ) +
+    
+    theme_minimal(base_size = 13) +
+    
+    theme(
+      plot.title       = element_text(face = "bold", size = 15),
+      axis.text.x      = element_text(angle = 45, hjust = 1),
+      legend.position  = "bottom",
+      panel.grid.minor   = element_blank(),
+      panel.grid.major.x = element_line(color = "grey80", linetype = "dashed", linewidth = 0.4)
+    )
+  
+  print(p)
+}
+
+# =========================================================
+# 4. GÉNÉRATION DES GRAPHIQUES
+# =========================================================
+
+walk(c("YFT", "BET"), ~ plot_espece_cumul(.x, data_clean))
